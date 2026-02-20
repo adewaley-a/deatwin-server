@@ -77,3 +77,29 @@ app.post('/withdraw', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+
+// Add this above your other app.post routes
+app.post('/initialize-payment', async (req, res) => {
+    const { email, amount } = req.body;
+    try {
+        const response = await paystack.post('/transaction/initialize', {
+            email,
+            amount: Math.round(amount * 100), // Convert to Kobo
+            callback_url: "https://deatwin.netlify.app/second-page", // CHANGE THIS to your actual site URL
+            metadata: {
+                custom_fields: [
+                    {
+                        display_name: "Action",
+                        variable_name: "action",
+                        value: "deposit"
+                    }
+                ]
+            }
+        });
+        // Send the authorization URL back to the frontend
+        res.status(200).json({ url: response.data.data.authorization_url });
+    } catch (error) {
+        console.error("Payment Init Error:", error.response?.data || error.message);
+        res.status(500).json({ success: false, message: "Could not generate payment link" });
+    }
+});
