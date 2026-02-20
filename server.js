@@ -5,13 +5,11 @@ const cors = require('cors');
 const axios = require('axios');
 const app = express();
 
-
 const serviceAccount = require("./serviceAccountKey.json");
 if (!admin.apps.length) {
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 }
 const db = admin.firestore();
-
 
 app.use(cors());
 app.use(express.json());
@@ -24,6 +22,77 @@ const paystack = axios.create({
     }
 });
 
+/**
+ * 1. INITIALIZE PAYMENT
+ */
+app.post('/initialize-payment', async (req, res) => {
+    const { email, amount } = req.body;
+    try {
+        const response = await paystack.post('/transaction/initialize', {
+            email,
+            amount: Math.round(amount * 100), 
+            callback_url: "https://deatwin.netlify.app/second-page", 
+            metadata: {
+                custom_fields: [
+                    {
+                        display_name: "Action",
+                        variable_name: "action",
+                        value: "deposit"
+                    }
+                ]
+            }
+        });
+        res.status(200).json({ url: response.data.data.authorization_url });
+    } catch (error) {
+        console.error("Payment Init Error:", error.response?.data || error.message);
+        res.status(500).json({ success: false, message: "Could not generate payment link" });
+    }
+});
+
+/**
+ * 2. PAYSTACK WEBHOOK (Updates Balance)
+ */
+app.post('/paystack-webhook', async (req, res) => {
+    // SECURITY: Verify that this request actually came from Paystack
+    const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
+                       .update(JSON.stringify(req.body))
+                       .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+        return res.sendStatus(400); // Secret hash doesn't match
+    }
+
+    const event = req.body;
+
+    // Only process if the payment was successful
+    if (event.event === 'charge.success') {
+        const amountNaira = event.data.amount / 100;
+        const customerEmail = event.data.customer.email;
+
+        try {
+            const usersRef = db.collection('users');
+            const snapshot = await usersRef.where('email', '==', customerEmail).limit(1).get();
+
+            if (!snapshot.empty) {
+                const userDoc = snapshot.docs[0];
+                await userDoc.ref.update({
+                    wallet_balance: admin.firestore.FieldValue.increment(amountNaira)
+                });
+                console.log(`Successfully credited ${customerEmail} with ₦${amountNaira}`);
+            } else {
+                console.log(`User not found for email: ${customerEmail}`);
+            }
+        } catch (err) {
+            console.error("Database Update Error:", err);
+        }
+    }
+
+    res.sendStatus(200); // Tell Paystack we received it
+});
+
+/**
+ * 3. WITHDRAWAL LOGIC
+ */
 app.post('/withdraw', async (req, res) => {
     const { userId, amount, bankCode, accountNumber } = req.body;
 
@@ -31,7 +100,6 @@ app.post('/withdraw', async (req, res) => {
         const userRef = db.collection('users').doc(userId);
         let finalRecipientCode;
 
-        // 1. Transaction to handle Firestore safely
         await db.runTransaction(async (t) => {
             const userDoc = await t.get(userRef);
             if (!userDoc.exists) throw new Error("User not found");
@@ -41,7 +109,6 @@ app.post('/withdraw', async (req, res) => {
 
             finalRecipientCode = userData.paystack_recipient_code;
 
-            // 2. Create recipient if missing
             if (!finalRecipientCode) {
                 if (!bankCode || !accountNumber) throw new Error("Bank details required for first withdrawal");
                 
@@ -59,7 +126,6 @@ app.post('/withdraw', async (req, res) => {
             t.update(userRef, { wallet_balance: admin.firestore.FieldValue.increment(-amount) });
         });
 
-        // 3. Trigger Real Money Transfer
         await paystack.post('/transfer', {
             source: "balance",
             amount: amount * 100,
@@ -73,33 +139,5 @@ app.post('/withdraw', async (req, res) => {
     }
 });
 
-// ... Webhook remains the same ...
-
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
-
-// Add this above your other app.post routes
-app.post('/initialize-payment', async (req, res) => {
-    const { email, amount } = req.body;
-    try {
-        const response = await paystack.post('/transaction/initialize', {
-            email,
-            amount: Math.round(amount * 100), // Convert to Kobo
-            callback_url: "https://deatwin.netlify.app/second-page", // CHANGE THIS to your actual site URL
-            metadata: {
-                custom_fields: [
-                    {
-                        display_name: "Action",
-                        variable_name: "action",
-                        value: "deposit"
-                    }
-                ]
-            }
-        });
-        // Send the authorization URL back to the frontend
-        res.status(200).json({ url: response.data.data.authorization_url });
-    } catch (error) {
-        console.error("Payment Init Error:", error.response?.data || error.message);
-        res.status(500).json({ success: false, message: "Could not generate payment link" });
-    }
-});
