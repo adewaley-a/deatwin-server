@@ -15,79 +15,66 @@ app.use(cors());
 app.use(express.json());
 
 /**
- * SECURE LOCK-IN AND ESCROW
- * This handles the 80/20 split and starts the game
+ * SECURE LOCK-IN AND ESCROW (Optimized for Speed)
  */
 app.post('/lock-in-bet', async (req, res) => {
-    const { roomId, userId } = req.body;
+    const { roomId } = req.body;
 
     try {
-        await db.runTransaction(async (t) => {
-            const roomRef = db.collection('rooms').doc(roomId);
-            const roomDoc = await t.get(roomRef);
-            
-            if (!roomDoc.exists) throw new Error("Room not found");
-            const data = roomDoc.data();
+        const roomRef = db.collection('rooms').doc(roomId);
+        const roomDoc = await roomRef.get();
+        
+        if (!roomDoc.exists) throw new Error("Room not found");
+        const data = roomDoc.data();
 
-            // 1. Check if both players have voted and votes match
-            const voteValues = Object.values(data.votes || {});
-            if (voteValues.length !== 2 || voteValues[0] !== voteValues[1]) {
-                throw new Error("Votes do not match yet");
-            }
+        // 1. Prevent double-charging if the room is already active
+        if (data.status === "active") {
+            return res.status(200).json({ success: true, message: "Already active" });
+        }
 
-            // 2. Prevent double-charging if the room is already active
-            if (data.status === "active") return;
+        // 2. Check if both players have voted and votes match
+        const voteValues = Object.values(data.votes || {});
+        if (voteValues.length !== 2 || voteValues[0] !== voteValues[1]) {
+            throw new Error("Votes do not match yet");
+        }
 
-            const stake = voteValues[0]; // The agreed amount (e.g., 500)
-            const hostRef = db.collection('users').doc(data.hostId);
-            const guestRef = db.collection('users').doc(data.guestId);
+        const stake = voteValues[0]; 
+        const totalStake = stake * 2;
+        const prizePool = totalStake * 0.8;
+        const adminCommission = totalStake * 0.2;
 
-            const hostSnap = await t.get(hostRef);
-            const guestSnap = await t.get(guestRef);
-
-            // 3. Verify both players have enough money
-            if ((hostSnap.data().wallet_balance || 0) < stake || (guestSnap.data().wallet_balance || 0) < stake) {
-                throw new Error("One or more players have insufficient balance");
-            }
-
-            // 4. Calculate 80/20 Split
-            // Total Pool = stake * 2 (e.g., 500 * 2 = 1000)
-            // Winner Prize (80%) = 800
-            // Admin Commission (20%) = 200
-            const totalStake = stake * 2;
-            const prizePool = totalStake * 0.8;
-            const adminCommission = totalStake * 0.2;
-
-            // 5. Deduct money from both players
-            t.update(hostRef, { 
-                wallet_balance: admin.firestore.FieldValue.increment(-stake) 
-            });
-            t.update(guestRef, { 
-                wallet_balance: admin.firestore.FieldValue.increment(-stake) 
-            });
-
-            // 6. Record commission in your admin settings
-            const adminRef = db.collection('admin').doc('finances');
-            t.set(adminRef, {
-                total_commission: admin.firestore.FieldValue.increment(adminCommission),
-                lastUpdate: admin.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-
-            // 7. Activate the room and set the prize
-            t.update(roomRef, {
-                status: "active",
-                entryFee: stake,
-                prizePool: prizePool,
-                activatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
+        // 3. FAST ACTIVATE: Update room status first to trigger frontend navigation
+        await roomRef.update({
+            status: "active",
+            entryFee: stake,
+            prizePool: prizePool,
+            activatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        console.log(`Bet locked for Room ${roomId}. Game is now Active.`);
+        // 4. Respond to frontend immediately so players see the game start
         res.status(200).json({ success: true });
+
+        // 5. BACKGROUND PROCESSING: Deduct money using a Batch write
+        const hostRef = db.collection('users').doc(data.hostId);
+        const guestRef = db.collection('users').doc(data.guestId);
+        const adminRef = db.collection('admin').doc('finances');
+
+        const batch = db.batch();
+        batch.update(hostRef, { wallet_balance: admin.firestore.FieldValue.increment(-stake) });
+        batch.update(guestRef, { wallet_balance: admin.firestore.FieldValue.increment(-stake) });
+        batch.set(adminRef, {
+            total_commission: admin.firestore.FieldValue.increment(adminCommission),
+            lastUpdate: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+
+        await batch.commit();
+        console.log(`Transaction for Room ${roomId} finalized in background.`);
 
     } catch (error) {
         console.error("LOCK-IN ERROR:", error.message);
-        res.status(400).json({ success: false, message: error.message });
+        if (!res.headersSent) {
+            res.status(400).json({ success: false, message: error.message });
+        }
     }
 });
 
@@ -127,21 +114,16 @@ app.post('/initialize-payment', async (req, res) => {
 });
 
 /**
- * 2. PAYSTACK WEBHOOK (Updates Balance)
+ * 2. PAYSTACK WEBHOOK
  */
 app.post('/paystack-webhook', async (req, res) => {
-    // SECURITY: Verify that this request actually came from Paystack
     const hash = crypto.createHmac('sha512', process.env.PAYSTACK_SECRET_KEY)
                        .update(JSON.stringify(req.body))
                        .digest('hex');
 
-    if (hash !== req.headers['x-paystack-signature']) {
-        return res.sendStatus(400); // Secret hash doesn't match
-    }
+    if (hash !== req.headers['x-paystack-signature']) return res.sendStatus(400);
 
     const event = req.body;
-
-    // Only process if the payment was successful
     if (event.event === 'charge.success') {
         const amountNaira = event.data.amount / 100;
         const customerEmail = event.data.customer.email;
@@ -151,20 +133,15 @@ app.post('/paystack-webhook', async (req, res) => {
             const snapshot = await usersRef.where('email', '==', customerEmail).limit(1).get();
 
             if (!snapshot.empty) {
-                const userDoc = snapshot.docs[0];
-                await userDoc.ref.update({
+                await snapshot.docs[0].ref.update({
                     wallet_balance: admin.firestore.FieldValue.increment(amountNaira)
                 });
-                console.log(`Successfully credited ${customerEmail} with ₦${amountNaira}`);
-            } else {
-                console.log(`User not found for email: ${customerEmail}`);
             }
         } catch (err) {
             console.error("Database Update Error:", err);
         }
     }
-
-    res.sendStatus(200); // Tell Paystack we received it
+    res.sendStatus(200);
 });
 
 /**
@@ -187,7 +164,7 @@ app.post('/withdraw', async (req, res) => {
             finalRecipientCode = userData.paystack_recipient_code;
 
             if (!finalRecipientCode) {
-                if (!bankCode || !accountNumber) throw new Error("Bank details required for first withdrawal");
+                if (!bankCode || !accountNumber) throw new Error("Bank details required");
                 
                 const rcpt = await paystack.post('/transferrecipient', {
                     type: "nuban",
@@ -217,4 +194,4 @@ app.post('/withdraw', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`Staking Server running on ${PORT}`));
